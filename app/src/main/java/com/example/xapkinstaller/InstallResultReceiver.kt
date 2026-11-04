@@ -7,9 +7,17 @@ import android.content.pm.PackageInstaller
 import android.os.Build
 import kotlinx.coroutines.flow.MutableStateFlow
 
-/** Holds the latest install message so the UI can show it. */
+sealed interface InstallState {
+    data object Idle : InstallState
+    data class Working(val message: String) : InstallState
+    data class Ready(val manifest: XapkManifest) : InstallState
+    data class Done(val manifest: XapkManifest?) : InstallState
+    data class Failed(val message: String) : InstallState
+}
+
 object InstallStatus {
-    val message = MutableStateFlow<String?>(null)
+    val state = MutableStateFlow<InstallState>(InstallState.Idle)
+    var current: XapkManifest? = null
 }
 
 /**
@@ -19,8 +27,7 @@ object InstallStatus {
 class InstallResultReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
-        val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
-        when (status) {
+        when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
                 val confirm: Intent? = if (Build.VERSION.SDK_INT >= 33) {
                     intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
@@ -31,11 +38,28 @@ class InstallResultReceiver : BroadcastReceiver() {
                 confirm?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 if (confirm != null) context.startActivity(confirm)
             }
-            PackageInstaller.STATUS_SUCCESS -> InstallStatus.message.value = "Installed successfully."
+            PackageInstaller.STATUS_SUCCESS ->
+                InstallStatus.state.value = InstallState.Done(InstallStatus.current)
+            PackageInstaller.STATUS_FAILURE_ABORTED ->
+                InstallStatus.state.value = InstallState.Failed("Install was cancelled.")
             else -> {
-                val detail = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
-                InstallStatus.message.value = "Install failed: ${detail ?: "status $status"}"
+                val detail = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: "status $status"
+                InstallStatus.state.value = InstallState.Failed(friendlyError(detail))
             }
         }
+    }
+
+    private fun friendlyError(detail: String): String = when {
+        "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in detail || "signatures do not match" in detail ->
+            "The installed version of this app was signed with a different key. Uninstall it first, then try again."
+        "INSTALL_FAILED_VERSION_DOWNGRADE" in detail ->
+            "A newer version of this app is already installed."
+        "INSTALL_FAILED_INSUFFICIENT_STORAGE" in detail ->
+            "Not enough storage space."
+        "INSTALL_FAILED_NO_MATCHING_ABIS" in detail ->
+            "This app isn't built for your phone's processor."
+        "INSTALL_FAILED_OLDER_SDK" in detail ->
+            "This app needs a newer version of Android."
+        else -> "Install failed: $detail"
     }
 }

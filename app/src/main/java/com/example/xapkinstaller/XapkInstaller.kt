@@ -4,14 +4,18 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
-import androidx.documentfile.provider.DocumentFile
+import android.os.Build
+import android.os.Environment
+import android.provider.OpenableColumns
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.zip.ZipFile
 
-/** One APK inside the XAPK (base APK or a split such as a language or ABI split). */
+/** One APK inside the bundle (base APK or a split such as a language or ABI split). */
 data class SplitApk(val file: String, val id: String)
 
 /** A non-APK data file (OBB expansion) that must be copied to Android/obb/<package>/. */
@@ -20,126 +24,214 @@ data class Expansion(val file: String, val fileName: String)
 data class XapkManifest(
     val packageName: String,
     val name: String,
+    val versionName: String,
     val splitApks: List<SplitApk>,
     val expansions: List<Expansion>,
+    val icon: Bitmap?,
+    val totalSize: Long,
 )
-
-/** Thrown when the XAPK has OBB files but the user has not granted access to Android/obb yet. */
-class ObbAccessRequired : Exception("This XAPK has data files that need access to Android/obb.")
 
 object XapkInstaller {
 
-    /** Copies the picked document into the app cache so it can be opened as a zip file. */
+    /** Every ABI name Android uses in split APK names, e.g. config.arm64_v8a.apk. */
+    private val ALL_ABIS = listOf("arm64_v8a", "armeabi_v7a", "armeabi", "x86_64", "x86", "mips", "mips64")
+
+    /** Copies the opened file into the app cache so it can be read as a zip. */
     fun copyToCache(context: Context, uri: Uri): File {
-        val out = File(context.cacheDir, "pending.xapk")
+        context.cacheDir.listFiles()?.forEach { it.delete() }
+        val out = File(context.cacheDir, "pending.bundle")
         val input = context.contentResolver.openInputStream(uri)
             ?: throw IllegalStateException("Could not open the selected file")
         input.use { src -> out.outputStream().use { dst -> src.copyTo(dst) } }
         return out
     }
 
-    /** Reads manifest.json from the XAPK. Falls back to scanning for .apk files if it is missing. */
-    fun readManifest(xapk: File): XapkManifest {
-        ZipFile(xapk).use { zip ->
+    /** Best-effort display name for a content:// or file:// URI. */
+    fun displayName(context: Context, uri: Uri): String {
+        if (uri.scheme == "content") {
+            runCatching {
+                context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                    if (c.moveToFirst()) return c.getString(0)
+                }
+            }
+        }
+        return uri.lastPathSegment?.substringAfterLast('/') ?: "file"
+    }
+
+    /** True if the file is a plain single APK rather than a bundle. */
+    fun isPlainApk(file: File): Boolean = ZipFile(file).use { it.getEntry("AndroidManifest.xml") != null }
+
+    /**
+     * Reads the bundle. Supports XAPK (manifest.json), APKS / SAI bundles (just APKs in a zip,
+     * sometimes with meta.sai_v2.json) and plain single APKs.
+     */
+    fun readManifest(context: Context, file: File, fallbackName: String): XapkManifest {
+        if (isPlainApk(file)) {
+            val info = context.packageManager.getPackageArchiveInfo(file.path, 0)
+            val label = info?.applicationInfo?.let {
+                it.sourceDir = file.path
+                it.publicSourceDir = file.path
+                context.packageManager.getApplicationLabel(it).toString()
+            }
+            return XapkManifest(
+                packageName = info?.packageName ?: "unknown",
+                name = label ?: fallbackName,
+                versionName = info?.versionName ?: "",
+                splitApks = listOf(SplitApk("__self__", "base")),
+                expansions = emptyList(),
+                icon = null,
+                totalSize = file.length(),
+            )
+        }
+
+        ZipFile(file).use { zip ->
+            val icon = zip.getEntry("icon.png")?.let { e ->
+                runCatching { zip.getInputStream(e).use { BitmapFactory.decodeStream(it) } }.getOrNull()
+            }
             val entry = zip.getEntry("manifest.json")
+
             if (entry == null) {
-                // Not every XAPK has a manifest; treat every .apk in the archive as a split.
                 val apks = zip.entries().toList()
                     .filter { it.name.endsWith(".apk") && !it.isDirectory }
-                    .map { SplitApk(it.name, it.name.substringBeforeLast('.')) }
-                require(apks.isNotEmpty()) { "Not a valid XAPK: no manifest.json and no APK files" }
+                    .map { SplitApk(it.name, it.name.substringAfterLast('/').substringBeforeLast('.')) }
+                require(apks.isNotEmpty()) { "This file doesn't contain any APKs" }
+                val meta = zip.getEntry("meta.sai_v2.json")?.let { e ->
+                    runCatching { zip.getInputStream(e).use { JSONObject(it.bufferedReader().readText()) } }.getOrNull()
+                }
                 return XapkManifest(
-                    packageName = "unknown",
-                    name = xapk.nameWithoutExtension,
-                    splitApks = apks,
+                    packageName = meta?.optString("package")?.takeIf { it.isNotBlank() } ?: "unknown",
+                    name = meta?.optString("label")?.takeIf { it.isNotBlank() } ?: fallbackName.substringBeforeLast('.'),
+                    versionName = meta?.optString("version_name") ?: "",
+                    splitApks = filterSplits(apks),
                     expansions = emptyList(),
+                    icon = icon,
+                    totalSize = file.length(),
                 )
             }
 
             val json = zip.getInputStream(entry).use { JSONObject(it.bufferedReader().readText()) }
             val packageName = json.getString("package_name")
-            val name = json.optString("name", packageName)
 
             val splitsJson = json.optJSONArray("split_apks") ?: JSONArray()
-            val splits = (0 until splitsJson.length()).map { i ->
+            var splits = (0 until splitsJson.length()).map { i ->
                 val o = splitsJson.getJSONObject(i)
                 SplitApk(file = o.getString("file"), id = o.optString("id", ""))
             }
-            require(splits.isNotEmpty()) { "manifest.json lists no APK files" }
+            if (splits.isEmpty()) {
+                // Older XAPKs have a single "<package>.apk" and no split list.
+                splits = zip.entries().toList()
+                    .filter { it.name.endsWith(".apk") && !it.isDirectory }
+                    .map { SplitApk(it.name, it.name.substringBeforeLast('.')) }
+            }
+            require(splits.isNotEmpty()) { "This XAPK lists no APK files" }
 
             val expansionsJson = json.optJSONArray("expansions") ?: JSONArray()
             val expansions = (0 until expansionsJson.length()).map { i ->
                 val o = expansionsJson.getJSONObject(i)
-                val file = o.getString("file")
-                // install_path looks like "Android/obb/<pkg>/main.1.<pkg>.obb"; keep just the file name.
-                val installPath = o.optString("install_path", file)
-                Expansion(file = file, fileName = installPath.substringAfterLast('/'))
+                val f = o.getString("file")
+                val installPath = o.optString("install_path", f)
+                Expansion(file = f, fileName = installPath.substringAfterLast('/'))
+            }.toMutableList()
+            // Some XAPKs ship an Android/obb folder without listing it in the manifest.
+            if (expansions.isEmpty()) {
+                zip.entries().toList()
+                    .filter { !it.isDirectory && it.name.startsWith("Android/obb/") }
+                    .forEach { expansions += Expansion(it.name, it.name.substringAfterLast('/')) }
             }
 
-            return XapkManifest(packageName, name, splits, expansions)
+            return XapkManifest(
+                packageName = packageName,
+                name = json.optString("name", packageName),
+                versionName = json.optString("version_name", ""),
+                splitApks = filterSplits(splits),
+                expansions = expansions,
+                icon = icon,
+                totalSize = file.length(),
+            )
         }
     }
 
     /**
-     * Installs every APK in the XAPK as one PackageInstaller session, so split APKs
-     * are installed together. Expansion (OBB) files are copied to [obbTreeUri] first.
+     * Drops ABI splits this phone can't use (e.g. an x86 split on an ARM phone), which
+     * otherwise make the whole install fail. Language and screen-density splits are kept.
      */
-    fun install(context: Context, xapk: File, manifest: XapkManifest, obbTreeUri: Uri?) {
-        if (manifest.expansions.isNotEmpty() && obbTreeUri == null) throw ObbAccessRequired()
+    private fun filterSplits(splits: List<SplitApk>): List<SplitApk> {
+        val deviceAbis = Build.SUPPORTED_ABIS.map { it.replace('-', '_') }
+        val abiSplits = splits.filter { s -> abiOf(s) != null }
+        if (abiSplits.isEmpty()) return splits
 
+        // Keep only the split for the phone's preferred ABI that the bundle actually has.
+        val best = deviceAbis.firstOrNull { abi -> abiSplits.any { abiOf(it) == abi } }
+        return splits.filter { s ->
+            val abi = abiOf(s)
+            abi == null || abi == best
+        }
+    }
+
+    private fun abiOf(split: SplitApk): String? {
+        val name = (split.id.ifBlank { split.file.substringAfterLast('/') }).lowercase()
+        return ALL_ABIS.firstOrNull { abi -> name.endsWith("config.$abi") || name.endsWith("config.$abi.apk") || name.contains("config.$abi.") }
+    }
+
+    fun obbRoot(): File = File(Environment.getExternalStorageDirectory(), "Android/obb")
+
+    /** Installs every APK as one PackageInstaller session, so split APKs go in together. */
+    fun install(
+        context: Context,
+        file: File,
+        manifest: XapkManifest,
+        onProgress: (String) -> Unit,
+    ) {
+        if (manifest.expansions.isNotEmpty()) {
+            ZipFile(file).use { zip ->
+                val dir = File(obbRoot(), manifest.packageName).apply { mkdirs() }
+                manifest.expansions.forEachIndexed { i, exp ->
+                    onProgress("Copying game data ${i + 1} of ${manifest.expansions.size}...")
+                    val entry = zip.getEntry(exp.file) ?: error("Missing ${exp.file} inside the file")
+                    File(dir, exp.fileName).outputStream().use { out ->
+                        zip.getInputStream(entry).use { it.copyTo(out) }
+                    }
+                }
+            }
+        }
+
+        onProgress("Installing ${manifest.name}...")
         val installer = context.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
         if (manifest.packageName != "unknown") params.setAppPackageName(manifest.packageName)
+        params.setInstallReason(android.content.pm.PackageManager.INSTALL_REASON_USER)
+        if (Build.VERSION.SDK_INT >= 31) {
+            // Skips the extra confirm screen for updates of apps this installer installed.
+            params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+        }
 
         val sessionId = installer.createSession(params)
         installer.openSession(sessionId).use { session ->
-            ZipFile(xapk).use { zip ->
-                for (split in manifest.splitApks) {
-                    val entry = zip.getEntry(split.file)
-                        ?: throw IllegalStateException("Missing ${split.file} inside the XAPK")
-                    val name = split.file.substringAfterLast('/')
-                    session.openWrite(name, 0, entry.size).use { out ->
-                        zip.getInputStream(entry).use { it.copyTo(out) }
-                        session.fsync(out)
-                    }
+            if (manifest.splitApks.singleOrNull()?.file == "__self__") {
+                session.openWrite("base.apk", 0, file.length()).use { out ->
+                    file.inputStream().use { it.copyTo(out) }
+                    session.fsync(out)
                 }
-
-                if (obbTreeUri != null) {
-                    for (exp in manifest.expansions) {
-                        copyExpansion(context, zip, exp, manifest.packageName, obbTreeUri)
+            } else {
+                ZipFile(file).use { zip ->
+                    for (split in manifest.splitApks) {
+                        val entry = zip.getEntry(split.file) ?: error("Missing ${split.file} inside the file")
+                        val name = split.file.substringAfterLast('/')
+                        session.openWrite(name, 0, entry.size).use { out ->
+                            zip.getInputStream(entry).use { it.copyTo(out) }
+                            session.fsync(out)
+                        }
                     }
                 }
             }
 
-            val resultIntent = Intent(context, InstallResultReceiver::class.java)
             val pending = PendingIntent.getBroadcast(
                 context,
                 sessionId,
-                resultIntent,
+                Intent(context, InstallResultReceiver::class.java),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
             )
             session.commit(pending.intentSender)
         }
-    }
-
-    private fun copyExpansion(
-        context: Context,
-        zip: ZipFile,
-        exp: Expansion,
-        packageName: String,
-        obbTreeUri: Uri,
-    ) {
-        val entry = zip.getEntry(exp.file) ?: throw IllegalStateException("Missing ${exp.file} inside the XAPK")
-        val tree = DocumentFile.fromTreeUri(context, obbTreeUri)
-            ?: throw IllegalStateException("Cannot open the Android/obb folder")
-        val pkgDir = tree.findFile(packageName) ?: tree.createDirectory(packageName)
-            ?: throw IllegalStateException("Cannot create the $packageName folder in Android/obb")
-
-        pkgDir.findFile(exp.fileName)?.delete()
-        val dest = pkgDir.createFile("application/octet-stream", exp.fileName)
-            ?: throw IllegalStateException("Cannot create ${exp.fileName}")
-        val out = context.contentResolver.openOutputStream(dest.uri)
-            ?: throw IllegalStateException("Cannot write ${exp.fileName}")
-        out.use { dst -> zip.getInputStream(entry).use { it.copyTo(dst) } }
     }
 }

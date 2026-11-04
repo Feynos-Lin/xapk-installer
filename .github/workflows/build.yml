@@ -24,13 +24,13 @@ jobs:
         with:
           gradle-version: '8.10'
 
-      - name: Build debug APK
-        run: gradle :app:assembleDebug --no-daemon
+      - name: Build signed release APK
+        run: gradle :app:assembleRelease --no-daemon
 
       - name: Rename APK
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/xapk-installer.apk
+          cp app/build/outputs/apk/release/app-release.apk dist/xapk-installer.apk
 
       - uses: actions/upload-artifact@v4
         with:

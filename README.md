@@ -1,29 +1,32 @@
 # XAPK Installer
 
-A small Android app that installs `.xapk` files (an APK bundle with optional split APKs and OBB data files).
+An Android app that installs `.xapk`, `.apks` and `.apk` files, similar to APKMirror Installer. Tap a file in your file manager or downloads list, pick **XAPK Installer**, and tap **Install**.
 
-## Build
+## Download
 
-**Option A: GitHub Actions (no local setup).** Push this folder to a GitHub repo. The workflow in `.github/workflows/build.yml` builds a debug APK. Download it from the run's **Artifacts** section.
+Get the latest APK from [Releases](../../releases/latest).
 
-**Option B: Android Studio.** Open the folder, let Gradle sync, then Build > Build APK(s).
+## First-time setup on your phone
 
-## Install on your phone
+The first install asks for these, and the app takes you to each settings screen when it needs it:
 
-1. Install the APK. Android will ask you to allow installs from this app (Settings > Apps > XAPK Installer > Install unknown apps).
-2. Open the app and tap **Choose .xapk file**, or open a `.xapk` in your file manager and pick XAPK Installer.
-3. If the XAPK has data files (OBB), choose the `Android/obb` folder when asked. Android 11+ may not let you select it on every device, in which case the OBB step will fail and the APKs will still install.
-4. Confirm the install prompt from Android.
+1. **Install unknown apps**: lets it install other apps.
+2. **All files access**: only asked for when a file includes game data (OBB), which has to be copied into `Android/obb/`.
 
-## How it works
+To make it the default for `.xapk` files, tap one, choose XAPK Installer, and pick **Always**.
 
-- An `.xapk` is a ZIP. `manifest.json` lists the package name and the APK files.
-- All APKs go into a single `PackageInstaller` session, so split APKs install together.
-- OBB files are copied to `Android/obb/<package>/` through the Storage Access Framework.
+## What it handles
 
-## Known limits
+- XAPK (APKPure-style, with `manifest.json`, split APKs and OBB data)
+- APKS / SAI bundles (a zip of split APKs)
+- Plain APKs
+- Drops ABI splits that don't match your phone's processor, so mixed bundles install cleanly
+- On Android 12+, updates of apps it installed skip the extra confirm screen
 
-- Android only installs APKs signed the same way as an existing install when updating. A signature mismatch will fail with a message from Android.
-- Some providers add a `.bin` extension to OBB files created with `application/octet-stream`. If a game can't find its data, check the file name in `Android/obb/<package>/`.
-- Untested on a device: this code was written without a local Android SDK, so expect to fix compile errors on the first build.
-- Change `com.example.xapkinstaller` to your own package name in `app/build.gradle.kts` and the Java/Kotlin package folders.
+Encrypted `.apkm` files from APKMirror can't be installed. Only APKMirror's own app can open those.
+
+## Updates
+
+Every build is signed with the same permanent key (`app/signing.keystore`), so new versions install over old ones. To release a new version, raise `versionCode` and `versionName` in `app/build.gradle.kts` and push to `main`. GitHub Actions builds the APK and publishes the release.
+
+Because the key is in this public repo, anyone could sign an APK that Android would accept as an update to this app. That's fine for a personal tool. For wider distribution, move the key to repo secrets.

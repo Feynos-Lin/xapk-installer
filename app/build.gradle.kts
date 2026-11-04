@@ -12,8 +12,29 @@ android {
         applicationId = "com.example.xapkinstaller"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
+    }
+
+    // One permanent key committed to the repo, so every build is signed the same way
+    // and new versions install over old ones. No GitHub secrets needed.
+    signingConfigs {
+        create("permanent") {
+            storeFile = file("signing.keystore")
+            storePassword = "feynosxapk"
+            keyAlias = "xapkinstaller"
+            keyPassword = "feynosxapk"
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("permanent")
+        }
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("permanent")
+        }
     }
 
     buildFeatures {
@@ -36,5 +57,4 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
-    implementation("androidx.documentfile:documentfile:1.0.1")
 }
