@@ -30,16 +30,23 @@ jobs:
       - name: Rename APK
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/xapk-installer-${GITHUB_REF_NAME//\//-}.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk dist/xapk-installer.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: xapk-installer
           path: dist/*.apk
 
+      - name: Read app version
+        id: version
+        run: echo "name=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)" >> "$GITHUB_OUTPUT"
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.name }}
+          name: XAPK Installer v${{ steps.version.outputs.name }}
+          target_commitish: ${{ github.sha }}
           files: dist/*.apk
           generate_release_notes: true
