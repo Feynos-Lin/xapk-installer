@@ -175,26 +175,43 @@ object XapkInstaller {
 
     fun obbRoot(): File = File(Environment.getExternalStorageDirectory(), "Android/obb")
 
+    /** Fallback location when Android won't let us write to Android/obb. */
+    fun downloadsObbDir(packageName: String): File =
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "obb/$packageName")
+
+    /** True if we can create and write files in Android/obb/<package>/ right now. */
+    fun canWriteObb(packageName: String): Boolean = runCatching {
+        val dir = File(obbRoot(), packageName)
+        dir.mkdirs()
+        val probe = File(dir, ".xapk-installer-probe")
+        probe.writeText("ok")
+        probe.delete()
+        true
+    }.getOrDefault(false)
+
+    /** Copies the OBB game data files into [targetDir]. */
+    fun copyExpansions(file: File, manifest: XapkManifest, targetDir: File, onProgress: (String) -> Unit) {
+        if (!targetDir.isDirectory && !targetDir.mkdirs()) error("Can't create ${targetDir.path}")
+        ZipFile(file).use { zip ->
+            manifest.expansions.forEachIndexed { i, exp ->
+                onProgress("Copying game data ${i + 1} of ${manifest.expansions.size}...")
+                val entry = zip.getEntry(exp.file) ?: error("Missing ${exp.file} inside the file")
+                val dest = File(targetDir, exp.fileName)
+                val tmp = File(targetDir, exp.fileName + ".part")
+                tmp.outputStream().use { out -> zip.getInputStream(entry).use { it.copyTo(out, 1 shl 20) } }
+                dest.delete()
+                if (!tmp.renameTo(dest)) error("Can't write ${dest.path}")
+            }
+        }
+    }
+
     /** Installs every APK as one PackageInstaller session, so split APKs go in together. */
-    fun install(
+    fun installApks(
         context: Context,
         file: File,
         manifest: XapkManifest,
         onProgress: (String) -> Unit,
     ) {
-        if (manifest.expansions.isNotEmpty()) {
-            ZipFile(file).use { zip ->
-                val dir = File(obbRoot(), manifest.packageName).apply { mkdirs() }
-                manifest.expansions.forEachIndexed { i, exp ->
-                    onProgress("Copying game data ${i + 1} of ${manifest.expansions.size}...")
-                    val entry = zip.getEntry(exp.file) ?: error("Missing ${exp.file} inside the file")
-                    File(dir, exp.fileName).outputStream().use { out ->
-                        zip.getInputStream(entry).use { it.copyTo(out) }
-                    }
-                }
-            }
-        }
-
         onProgress("Installing ${manifest.name}...")
         val installer = context.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)

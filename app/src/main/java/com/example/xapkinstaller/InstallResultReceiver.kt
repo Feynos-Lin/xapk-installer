@@ -18,6 +18,7 @@ sealed interface InstallState {
 object InstallStatus {
     val state = MutableStateFlow<InstallState>(InstallState.Idle)
     var current: XapkManifest? = null
+    var note: String? = null
 }
 
 /**

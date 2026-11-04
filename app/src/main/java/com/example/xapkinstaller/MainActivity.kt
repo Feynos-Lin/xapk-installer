@@ -49,6 +49,8 @@ class MainActivity : ComponentActivity() {
 
     private var pendingFile: File? = null
 
+    private val prefs by lazy { getSharedPreferences("xapk_installer", MODE_PRIVATE) }
+
     /** Set when we sent the user to a settings screen and should continue when they come back. */
     private var resumeInstallOnReturn = false
 
@@ -64,7 +66,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        handleIntent(intent)
+        if (intent?.getBooleanExtra(EXTRA_RESUME, false) == true) resumeAfterRestart()
+        else handleIntent(intent)
 
         setContent {
             val dark = isSystemInDarkTheme()
@@ -87,7 +90,14 @@ class MainActivity : ComponentActivity() {
         // Coming back from "Install unknown apps" or "All files access" settings.
         if (resumeInstallOnReturn) {
             resumeInstallOnReturn = false
-            installNow()
+            val manifest = InstallStatus.current
+            if (manifest != null && manifest.expansions.isNotEmpty() && packageManager.canRequestPackageInstalls()) {
+                // Android only gives an app Android/obb access when its process starts,
+                // so restart to pick up the permission that was just granted.
+                restartAndResume()
+            } else {
+                installNow()
+            }
         }
     }
 
@@ -106,6 +116,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openFile(uri: Uri) {
+        clearRestartState()
+        InstallStatus.note = null
         lifecycleScope.launch {
             InstallStatus.state.value = InstallState.Working("Reading file...")
             try {
@@ -135,32 +147,113 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        if (manifest.expansions.isNotEmpty() && !hasStorageAccess()) {
-            if (Build.VERSION.SDK_INT >= 30) {
-                resumeInstallOnReturn = true
-                InstallStatus.state.value = InstallState.Working("Turn on \"Allow access to manage all files\" so game data can be copied, then come back.")
-                runCatching {
-                    startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
-                }.onFailure {
-                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                }
-            } else {
-                legacyStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            }
+        if (manifest.expansions.isNotEmpty() && Build.VERSION.SDK_INT < 30 && !hasStorageAccess()) {
+            legacyStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
             return
         }
 
         lifecycleScope.launch {
             try {
+                var obbNote: String? = null
+                if (manifest.expansions.isNotEmpty()) {
+                    val canWrite = withContext(Dispatchers.IO) { XapkInstaller.canWriteObb(manifest.packageName) }
+                    val restarts = prefs.getInt(KEY_RESTARTS, 0)
+                    when {
+                        canWrite -> withContext(Dispatchers.IO) {
+                            XapkInstaller.copyExpansions(
+                                file, manifest,
+                                java.io.File(XapkInstaller.obbRoot(), manifest.packageName),
+                            ) { InstallStatus.state.value = InstallState.Working(it) }
+                        }
+                        // First failure: restart the app so Android re-checks our install permission.
+                        restarts == 0 -> { restartAndResume(); return@launch }
+                        // Second failure on Android 11+: try All files access, then restart again.
+                        restarts == 1 && Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager() -> {
+                            prefs.edit().putInt(KEY_RESTARTS, 1).apply()
+                            resumeInstallOnReturn = true
+                            InstallStatus.state.value = InstallState.Working(
+                                "Android blocked the game data folder. Turn on \"Allow access to manage all files\", then come back."
+                            )
+                            openAllFilesSettings()
+                            return@launch
+                        }
+                        // Still blocked: save the data to Downloads so it isn't lost.
+                        else -> {
+                            val dir = XapkInstaller.downloadsObbDir(manifest.packageName)
+                            withContext(Dispatchers.IO) {
+                                XapkInstaller.copyExpansions(file, manifest, dir) {
+                                    InstallStatus.state.value = InstallState.Working(it)
+                                }
+                            }
+                            obbNote = "Android wouldn't let this app write to Android/obb, so the game data was saved to " +
+                                "Download/obb/${manifest.packageName}. Move that folder into Android/obb with a file manager that can access it."
+                        }
+                    }
+                }
+                clearRestartState()
+                InstallStatus.note = obbNote
                 withContext(Dispatchers.IO) {
-                    XapkInstaller.install(this@MainActivity, file, manifest) { msg ->
+                    XapkInstaller.installApks(this@MainActivity, file, manifest) { msg ->
                         InstallStatus.state.value = InstallState.Working(msg)
                     }
                 }
             } catch (e: Exception) {
+                clearRestartState()
                 InstallStatus.state.value = InstallState.Failed("Install failed: ${e.message}")
             }
         }
+    }
+
+    private fun openAllFilesSettings() {
+        runCatching {
+            startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+        }.onFailure {
+            startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+        }
+    }
+
+    /** Saves where we were, relaunches the app in a fresh process, and continues the install. */
+    private fun restartAndResume() {
+        val file = pendingFile ?: return
+        val manifest = InstallStatus.current ?: return
+        prefs.edit()
+            .putString(KEY_PENDING_PATH, file.path)
+            .putString(KEY_PENDING_NAME, manifest.name)
+            .putInt(KEY_RESTARTS, prefs.getInt(KEY_RESTARTS, 0) + 1)
+            .commit()
+        InstallStatus.state.value = InstallState.Working("Restarting to apply permissions...")
+        val relaunch = Intent(this, MainActivity::class.java)
+            .putExtra(EXTRA_RESUME, true)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        startActivity(relaunch)
+        finishAffinity()
+        Runtime.getRuntime().exit(0)
+    }
+
+    private fun resumeAfterRestart() {
+        val path = prefs.getString(KEY_PENDING_PATH, null)
+        val name = prefs.getString(KEY_PENDING_NAME, null) ?: "file"
+        val file = path?.let(::File)?.takeIf { it.exists() }
+        if (file == null) {
+            clearRestartState()
+            return
+        }
+        pendingFile = file
+        lifecycleScope.launch {
+            InstallStatus.state.value = InstallState.Working("Continuing install...")
+            try {
+                val manifest = withContext(Dispatchers.IO) { XapkInstaller.readManifest(this@MainActivity, file, name) }
+                InstallStatus.current = manifest
+                installNow()
+            } catch (e: Exception) {
+                clearRestartState()
+                InstallStatus.state.value = InstallState.Failed("Couldn't continue: ${e.message}")
+            }
+        }
+    }
+
+    private fun clearRestartState() {
+        prefs.edit().remove(KEY_PENDING_PATH).remove(KEY_PENDING_NAME).remove(KEY_RESTARTS).apply()
     }
 
     private fun hasStorageAccess(): Boolean =
@@ -209,6 +302,10 @@ class MainActivity : ComponentActivity() {
                     state.manifest?.let { AppCard(it) }
                     Spacer(Modifier.height(16.dp))
                     Text("Installed.", style = MaterialTheme.typography.titleMedium)
+                    InstallStatus.note?.let {
+                        Spacer(Modifier.height(12.dp))
+                        Text(it)
+                    }
                     Spacer(Modifier.height(24.dp))
                     Row {
                         OutlinedButton(onClick = { InstallStatus.state.value = InstallState.Idle; finish() }) { Text("Done") }
@@ -254,5 +351,12 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    companion object {
+        private const val EXTRA_RESUME = "resume_install"
+        private const val KEY_PENDING_PATH = "pending_path"
+        private const val KEY_PENDING_NAME = "pending_name"
+        private const val KEY_RESTARTS = "restarts"
     }
 }

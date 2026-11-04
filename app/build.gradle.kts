@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.xapkinstaller"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     // One permanent key committed to the repo, so every build is signed the same way
